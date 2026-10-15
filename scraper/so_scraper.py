@@ -17,41 +17,137 @@ import re
 import sys
 import argparse
 import os
+import html as html_lib
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import urlsplit
 
 
 SO_API_BASE = "https://api.stackexchange.com/2.3"
 
-TAGS_BY_PRIORITY = [
-    ('linux', 800), ('bash', 800), ('python', 800), ('git', 600), ('docker', 400),
-    ('ssh', 300), ('nginx', 300), ('ubuntu', 300), ('debian', 200), ('centos', 200),
-    ('systemd', 200), ('cron', 200), ('chmod', 150), ('sudo', 150),
-    ('networking', 300), ('tcp', 200), ('http', 300), ('https', 200), ('dns', 200),
-    ('ssl', 250), ('ssl-certificate', 200), ('openssl', 250), ('curl', 250), ('wget', 150),
-    ('file-io', 300), ('tar', 150), ('gzip', 100), ('zip', 150),
-    ('pandas', 400), ('numpy', 350), ('matplotlib', 250), ('jupyter-notebook', 250),
-    ('pip', 250), ('virtualenv', 200), ('conda', 200),
-    ('pytorch', 350), ('tensorflow', 300), ('scikit-learn', 300),
-    ('machine-learning', 400), ('deep-learning', 300), ('keras', 250),
-    ('json', 300), ('csv', 250), ('regex', 350), ('xml', 200),
-    ('encryption', 200), ('cryptography', 200), ('hash', 150), ('security', 250),
-    ('debugging', 300), ('logging', 200), ('exception', 200),
-    ('sqlite', 250), ('mysql', 300), ('postgresql', 300), ('redis', 200), ('mongodb', 200),
-    ('web-scraping', 250), ('requests', 200), ('beautifulsoup', 200),
-    ('selenium', 200), ('api', 250),
-    ('algorithm', 350), ('sorting', 200), ('recursion', 200), ('data-structures', 250),
-    ('multiprocessing', 200), ('multithreading', 200), ('asyncio', 200),
-    ('string', 300), ('sed', 200), ('awk', 200), ('grep', 200),
-    ('ffmpeg', 200), ('opencv', 250), ('image-processing', 200),
-    ('makefile', 200), ('cmake', 200), ('gcc', 200),
-    ('vim', 200), ('tmux', 150),
-    ('r', 250), ('scipy', 200), ('sympy', 150),
-    ('shell', 400), ('command-line', 300), ('terminal', 200), ('unix', 300),
-    ('iptables', 150), ('firewall', 150), ('apache', 250),
-    ('qemu', 100), ('virtualization', 150), ('kubernetes', 200),
-    ('yaml', 200), ('nlp', 200), ('huggingface-transformers', 150), ('parquet', 100),
-]
+CONFIG_DIR = Path(__file__).resolve().parents[1] / 'config' / 'scraper'
+DEFAULT_TAGS_FILE = CONFIG_DIR / 'tags.json'
+
+
+def load_searches(tags_file: Path) -> List[Dict[str, Any]]:
+    """Load tag and/or keyword searches, retaining per-search collection settings."""
+    try:
+        config = json.loads(tags_file.read_text(encoding='utf-8'))
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f'{tags_file}: invalid JSON at line {e.lineno}, column {e.colno}.'
+        ) from None
+
+    if not isinstance(config, dict) or not isinstance(config.get('tags'), list):
+        raise ValueError(f'{tags_file}: expected an object with a "tags" array.')
+    if not config['tags']:
+        raise ValueError(f'{tags_file}: "tags" must not be empty.')
+
+    defaults = config.get('defaults', {})
+    if not isinstance(defaults, dict):
+        raise ValueError(f'{tags_file}: "defaults" must be an object.')
+
+    searches = []
+    seen = set()
+    seen_ids = set()
+    for index, entry in enumerate(config['tags'], 1):
+        if not isinstance(entry, dict):
+            raise ValueError(f'{tags_file}: entry {index} must be an object.')
+        tag = entry.get('tag', '')
+        query = entry.get('query')
+        weight = entry.get('weight')
+        if not isinstance(tag, str):
+            raise ValueError(f'{tags_file}: entry {index} needs a string "tag".')
+        tag = tag.strip()
+        if query is not None:
+            if not isinstance(query, str):
+                raise ValueError(f'{tags_file}: entry {index} "query" must be a string.')
+            query = query.strip()
+        if not tag and not query:
+            raise ValueError(f'{tags_file}: entry {index} needs a tag or a non-empty query.')
+        if type(weight) is not int or weight <= 0:
+            raise ValueError(f'{tags_file}: entry {index} needs a positive integer "weight".')
+        signature = (tag, query or '')
+        if signature in seen:
+            raise ValueError(f'{tags_file}: duplicate search for tag {tag!r}, query {query!r}.')
+        seen.add(signature)
+        search_id = entry.get('id', tag if not query else f'{tag}:{query}')
+        if not isinstance(search_id, str) or not search_id.strip() or search_id in seen_ids:
+            raise ValueError(f'{tags_file}: entry {index} needs a unique non-empty search id.')
+        seen_ids.add(search_id)
+        search = dict(defaults)
+        search.update(entry)
+        search.update(tag=tag, weight=weight, query=query, id=search_id)
+        for field in ('start_page', 'max_pages'):
+            if field in search and (type(search[field]) is not int or search[field] <= 0):
+                raise ValueError(f'{tags_file}: entry {index} "{field}" must be a positive integer.')
+        if 'min_score' in search and type(search['min_score']) is not int:
+            raise ValueError(f'{tags_file}: entry {index} "min_score" must be an integer.')
+        if 'sort' in search and search['sort'] not in ('votes', 'activity', 'creation'):
+            raise ValueError(f'{tags_file}: entry {index} "sort" must be votes, activity, or creation.')
+        terms = search.get('required_terms', [])
+        if not isinstance(terms, list) or any(not isinstance(term, str) or not term.strip() for term in terms):
+            raise ValueError(f'{tags_file}: entry {index} "required_terms" must be a list of non-empty strings.')
+        searches.append(search)
+
+    return searches
+
+
+def load_tags(tags_file: Path) -> List[Tuple[str, int]]:
+    """Compatibility view for callers interested only in tag/weight pairs."""
+    return [(search['tag'], search['weight']) for search in load_searches(tags_file)]
+
+
+def resolve_http_proxy(http_proxy: Optional[str] = None) -> Optional[Dict[str, str]]:
+    """Resolve a stage-one HTTP proxy without changing process-wide settings."""
+    proxy_url = http_proxy or next(
+        (os.environ[name] for name in (
+            'SO_HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY', 'http_proxy', 'HTTP_PROXY'
+        ) if os.environ.get(name)),
+        None,
+    )
+    if not proxy_url:
+        return None
+
+    proxy_url = proxy_url.strip()
+    error_message = 'HTTP proxy must be http://HOST[:PORT] or https://HOST[:PORT] with a valid port.'
+    try:
+        proxy = urlsplit(proxy_url)
+        valid = (
+            proxy.scheme in ('http', 'https')
+            and bool(proxy.hostname)
+            and proxy.port != 0
+            and proxy.path in ('', '/')
+            and not proxy.query
+            and not proxy.fragment
+            and not any(char.isspace() for char in proxy_url)
+        )
+    except ValueError:
+        raise ValueError(error_message) from None
+    if not valid:
+        raise ValueError(error_message)
+
+    return {'http': proxy_url, 'https': proxy_url}
+
+
+def proxy_endpoint(proxies: Dict[str, str]) -> str:
+    """Describe the configured proxy without exposing authentication details."""
+    proxy = urlsplit(proxies['https'])
+    host = proxy.hostname
+    if ':' in host:
+        host = f'[{host}]'
+    port = proxy.port or (443 if proxy.scheme == 'https' else 80)
+    return f'{proxy.scheme}://{host}:{port}'
+
+
+def request_error_message(error: Exception, proxies: Optional[Dict[str, str]]) -> str:
+    # Request exception text can contain the full URL, including the API key.
+    message = type(error).__name__
+    if isinstance(error, requests.exceptions.HTTPError) and error.response is not None:
+        message += f' (HTTP {error.response.status_code})'
+    if proxies:
+        message += f' (proxy={proxy_endpoint(proxies)})'
+    return message
 
 
 def get_questions_by_tag(
@@ -63,30 +159,48 @@ def get_questions_by_tag(
     sort: str = 'activity',
     start_page: int = 1,
     exclude_ids: set = None,
+    proxies: Optional[Dict[str, str]] = None,
+    query: Optional[str] = None,
+    required_terms: Optional[List[str]] = None,
+    max_questions: Optional[int] = None,
+    site: str = 'stackoverflow',
+    accepted_only: bool = True,
 ) -> tuple:
     questions = []
     should_stop = False
     if exclude_ids is None:
         exclude_ids = set()
+    collected_ids = set(exclude_ids)
 
     for page in range(start_page, start_page + max_pages):
         params = {
             'order': 'desc',
             'sort': sort,
-            'tagged': tag,
-            'site': 'stackoverflow',
+            'site': site,
             'filter': 'withbody',
             'pagesize': page_size,
             'page': page,
-            'min': min_score,
             'key': api_key,
         }
+        if tag:
+            params['tagged'] = tag
+        # API min is a score only for sort=votes; it is a timestamp otherwise.
+        if sort == 'votes':
+            params['min'] = min_score
+        endpoint = '/questions'
+        if query is not None:
+            endpoint = '/search/advanced'
+            if accepted_only:
+                params['accepted'] = 'true'
+            if query:
+                params['q'] = query
 
         try:
             response = requests.get(
-                f"{SO_API_BASE}/questions",
+                f"{SO_API_BASE}{endpoint}",
                 params=params,
-                timeout=30
+                timeout=30,
+                proxies=proxies,
             )
 
             if response.status_code == 429:
@@ -95,7 +209,7 @@ def get_questions_by_tag(
                 continue
 
             if response.status_code == 400:
-                print(f"  Tag '{tag}' invalid, skipping")
+                print(f"  API rejected search (tag={tag!r}, query={query!r}), skipping")
                 return questions, False
 
             response.raise_for_status()
@@ -109,10 +223,18 @@ def get_questions_by_tag(
                 break
 
             for item in data['items']:
-                if not item.get('accepted_answer_id'):
+                if accepted_only and not item.get('accepted_answer_id'):
                     continue
-                if item['question_id'] in exclude_ids:
+                if item.get('score', 0) < min_score:
                     continue
+                if item['question_id'] in collected_ids:
+                    continue
+                if required_terms:
+                    searchable = html_lib.unescape(
+                        item.get('title', '') + '\n' + item.get('body', '')
+                    ).casefold()
+                    if not any(term.casefold() in searchable for term in required_terms):
+                        continue
 
                 questions.append({
                     'question_id': item['question_id'],
@@ -126,6 +248,9 @@ def get_questions_by_tag(
                     'body': item.get('body', ''),
                     'creation_date': item.get('creation_date'),
                 })
+                collected_ids.add(item['question_id'])
+                if max_questions is not None and len(questions) >= max_questions:
+                    break
 
             quota = data.get('quota_remaining', 0)
             print(f"    page {page}: +{len(data['items'])} items, quota={quota}")
@@ -134,11 +259,14 @@ def get_questions_by_tag(
                 print("  Quota low, stopping")
                 return questions, True
 
+            if max_questions is not None and len(questions) >= max_questions:
+                break
+
             if not data.get('has_more', False):
                 break
 
         except Exception as e:
-            print(f"  Error: {e}")
+            print(f"  Error: {request_error_message(e, proxies)}")
             break
 
         time.sleep(0.5)
@@ -146,12 +274,17 @@ def get_questions_by_tag(
     return questions, should_stop
 
 
-def get_answers_batch(answer_ids: List[int], api_key: str) -> Dict[int, Dict]:
+def get_answers_batch(
+    answer_ids: List[int],
+    api_key: str,
+    proxies: Optional[Dict[str, str]] = None,
+    site: str = 'stackoverflow',
+) -> Dict[int, Dict]:
     """Fetch answers in batch (max 30 per request)"""
     results = {}
     ids_str = ';'.join(str(aid) for aid in answer_ids)
     params = {
-        'site': 'stackoverflow',
+        'site': site,
         'filter': 'withbody',
         'key': api_key,
     }
@@ -160,7 +293,8 @@ def get_answers_batch(answer_ids: List[int], api_key: str) -> Dict[int, Dict]:
         response = requests.get(
             f"{SO_API_BASE}/answers/{ids_str}",
             params=params,
-            timeout=30
+            timeout=30,
+            proxies=proxies,
         )
         if response.status_code == 200:
             data = response.json()
@@ -173,7 +307,7 @@ def get_answers_batch(answer_ids: List[int], api_key: str) -> Dict[int, Dict]:
                     'score': item.get('score', 0),
                 }
     except Exception as e:
-        print(f"  Failed to fetch answers batch: {e}")
+        print(f"  Failed to fetch answers batch: {request_error_message(e, proxies)}")
 
     return results
 
@@ -205,6 +339,9 @@ def save_data(questions, output_path, jsonl_path):
                 'score': q['score'],
                 'tags': q['tags'],
                 'search_tag': q.get('search_tag', ''),
+                'search_id': q.get('search_id', ''),
+                'search_query': q.get('search_query', ''),
+                'coverage_targets': q.get('coverage_targets', []),
                 'body_text': clean_html(q.get('body', ''))[:1000],
                 'answer_text': clean_html(q.get('accepted_answer', {}).get('body', ''))[:2000] if q.get('accepted_answer') else '',
             }
@@ -239,8 +376,34 @@ def main():
     parser.add_argument('--count', '-c', type=int, default=5000, help='Target question count')
     parser.add_argument('--dedup-dir', type=str, default=None, help='Directory with existing JSON files for deduplication')
     parser.add_argument('--api-key', type=str, default=None, help='StackOverflow API key')
+    parser.add_argument(
+        '--tags-file', type=Path, default=DEFAULT_TAGS_FILE,
+        help='Tag/weight JSON configuration (default: config/scraper/tags.json)',
+    )
+    parser.add_argument(
+        '--http-proxy', type=str, default=None,
+        help='HTTP proxy URL (defaults to SO_HTTP_PROXY, then HTTPS/HTTP proxy environment variables)',
+    )
+    parser.add_argument('--dry-run', action='store_true', help='Validate and display the collection plan without network requests or output files')
 
     args = parser.parse_args()
+
+    try:
+        proxies = resolve_http_proxy(args.http_proxy)
+        searches = load_searches(args.tags_file)
+    except (OSError, ValueError) as e:
+        parser.error(str(e))
+
+    if args.count <= 0:
+        parser.error('--count must be positive.')
+    if args.dry_run:
+        total_weight = sum(search['weight'] for search in searches)
+        print(json.dumps({
+            'tags_file': str(args.tags_file.resolve()),
+            'target_count': args.count,
+            'searches': [dict(search, relative_target=max(1, int(search['weight'] * args.count / total_weight))) for search in searches],
+        }, ensure_ascii=False, indent=2))
+        return
 
     api_key = args.api_key or os.environ.get('SO_API_KEY', '')
     if not api_key:
@@ -253,8 +416,7 @@ def main():
     output_json = output_dir / f"so_data_r{args.round}.json"
     output_jsonl = output_dir / f"so_data_r{args.round}.jsonl"
 
-    tags = list(TAGS_BY_PRIORITY)
-    random.shuffle(tags)
+    random.shuffle(searches)
 
     dedup_dir = Path(args.dedup_dir) if args.dedup_dir else output_dir
     exclude_ids = load_existing_ids(dedup_dir)
@@ -266,24 +428,28 @@ def main():
     print("=" * 60)
     print(f"Round {args.round}: Crawling {target_count} StackOverflow questions")
     print(f"Excluding {len(exclude_ids)} existing IDs")
-    print(f"Tags: {len(tags)} (shuffled)")
+    print(f"Searches: {len(searches)} (shuffled)")
+    print(f"Tags file: {args.tags_file.resolve()}")
     print(f"Output: {output_json}")
+    if proxies:
+        print(f"HTTP proxy: {proxy_endpoint(proxies)}")
     print("=" * 60)
 
-    total_weight = sum(w for _, w in tags)
+    total_weight = sum(search['weight'] for search in searches)
 
-    for i, (tag, weight) in enumerate(tags, 1):
+    for i, search in enumerate(searches, 1):
+        tag, weight = search['tag'], search['weight']
         if len(all_questions) >= target_count:
             print(f"\nReached target {target_count}!")
             break
 
         remaining = target_count - len(all_questions)
-        tag_target = min(int(weight * target_count / total_weight * 2.0), remaining)
+        tag_target = min(max(1, int(weight * target_count / total_weight)), remaining)
 
-        print(f"\n[{i}/{len(tags)}] Tag: {tag} (target: ~{tag_target}, total: {len(all_questions)})")
+        print(f"\n[{i}/{len(searches)}] Search: {search['id']} (tag={tag!r}, query={search['query']!r}, target: ~{tag_target}, total: {len(all_questions)})")
 
-        sort_method = random.choice(['activity', 'votes', 'creation'])
-        start_page = random.randint(1, 5)
+        sort_method = search.get('sort', random.choice(['activity', 'votes', 'creation']))
+        start_page = search.get('start_page', random.randint(1, 5))
 
         if tag_target > 500:
             min_score, max_pages = 15, 25
@@ -291,6 +457,8 @@ def main():
             min_score, max_pages = 20, 15
         else:
             min_score, max_pages = 30, 10
+        min_score = search.get('min_score', min_score)
+        max_pages = search.get('max_pages', max_pages)
 
         questions, should_stop = get_questions_by_tag(
             tag=tag,
@@ -300,6 +468,10 @@ def main():
             sort=sort_method,
             start_page=start_page,
             exclude_ids=seen_ids,
+            proxies=proxies,
+            query=search['query'],
+            required_terms=search.get('required_terms'),
+            max_questions=tag_target,
         )
 
         new_count = 0
@@ -307,6 +479,9 @@ def main():
             if q['question_id'] not in seen_ids:
                 seen_ids.add(q['question_id'])
                 q['search_tag'] = tag
+                q['search_id'] = search['id']
+                q['search_query'] = search['query'] or ''
+                q['coverage_targets'] = search.get('coverage_targets', [])
                 all_questions.append(q)
                 new_count += 1
                 if len(all_questions) >= target_count:
@@ -335,7 +510,7 @@ def main():
         batch = need_answers[batch_start:batch_start + batch_size]
         answer_ids = [aid for _, aid in batch]
 
-        results = get_answers_batch(answer_ids, api_key)
+        results = get_answers_batch(answer_ids, api_key, proxies=proxies)
 
         for idx, aid in batch:
             if aid in results:

@@ -1,6 +1,8 @@
 .env
 data/
+/config/scraper/archive/
 *.log
 api_token_usage.json
 __pycache__/
 *.pyc
+config/
